@@ -5,6 +5,7 @@ AI-Powered Docker Kubernetes Data Center Dashboard
 Features:
 - 100 Docker & 100 Kubernetes Scenarios
 - Real-Time Docker & K8s Feeds (Updated Every Second)
+- Access Info (IP/URL) for Deployed Scenarios
 - Full Implementation of 10 Phases
 """
 
@@ -19,7 +20,9 @@ from queue import Queue
 from flask import Flask, request, render_template_string, Response, redirect, session
 from flask_basicauth import BasicAuth
 import aiohttp
+import time
 from email.mime.text import MIMEText
+
 
 try:
     import ollama
@@ -50,8 +53,8 @@ app_state = {
     "scenario_result": "",
     "scaling_events": []
 }
-live_feed_docker = Queue(maxsize=500)
-live_feed_k8s = Queue(maxsize=500)
+docker_feed_queue = Queue(maxsize=500)
+k8s_feed_queue = Queue(maxsize=500)
 
 # User Roles for RBAC
 users = {
@@ -112,6 +115,38 @@ async def async_run_command(cmd):
         logging.error(f"Command failed: {cmd}, Error: {e}")
         return False, "", str(e)
 
+# Get Access Info for Docker (Synchronous wrapper)
+def get_docker_access_info(container_name):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    async def inner():
+        success, out, _ = await async_run_command(f"docker inspect {container_name} --format '{{{{.NetworkSettings.Ports}}}}'")
+        if success and out:
+            ports = out.strip()
+            if ports:
+                port_info = ports.split(":")[-1].split("}")[0] if ":" in ports else ports
+                return f"Access at: http://localhost:{port_info}"
+        return "Access info unavailable (no exposed ports or container not running)"
+    result = loop.run_until_complete(inner())
+    loop.close()
+    return result
+
+# Get Access Info for Kubernetes (Synchronous wrapper)
+def get_k8s_access_info(service_name):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    async def inner():
+        success, out, _ = await async_run_command(f"kubectl get service {service_name} -o jsonpath='{{.spec.ports[0].nodePort}}'")
+        if success and out:
+            node_port = out.strip()
+            success, cluster_ip, _ = await async_run_command("minikube ip")
+            if success and cluster_ip:
+                return f"Access at: http://{cluster_ip.strip()}:{node_port}"
+        return "Access info unavailable (service not exposed or Kubernetes not running)"
+    result = loop.run_until_complete(inner())
+    loop.close()
+    return result
+
 # Notification Functions
 async def send_email_notification(subject, message):
     try:
@@ -156,14 +191,14 @@ async def ai_auto_scaling():
                 await async_run_command("docker run -d --name auto_scaled_container ubuntu sleep infinity")
                 event = f"AI Auto-Scaled Docker: Added container at {datetime.now()}"
                 app_state["scaling_events"].append(event)
-                live_feed_docker.put(event)
+                docker_feed_queue.put(event)
                 await send_email_notification("AI Scaling Event", event)
                 await send_slack_discord_notification(event)
             elif app_state["environment"] == "k8s" and k8s_count < 3:
                 await async_run_command("kubectl create namespace auto_scaled_ns")
                 event = f"AI Auto-Scaled K8s: Added namespace at {datetime.now()}"
                 app_state["scaling_events"].append(event)
-                live_feed_k8s.put(event)
+                k8s_feed_queue.put(event)
                 await send_email_notification("AI Scaling Event", event)
                 await send_slack_discord_notification(event)
         await asyncio.sleep(60)
@@ -187,30 +222,30 @@ async def update_docker_status():
     if success:
         with state_lock:
             app_state["docker_containers"] = {line.split()[0]: " ".join(line.split()[1:]) for line in out.splitlines() if line.strip()}
-        live_feed_docker.put(f"Docker Status Update: {len(app_state['docker_containers'])} containers running at {datetime.now()}")
+        docker_feed_queue.put(f"Docker Status Update: {len(app_state['docker_containers'])} containers running at {datetime.now()}")
 
 async def docker_action(action, container=None, cmd=None):
     if action == "create":
         name = f"dc_container_{len(app_state['docker_containers']) + 1}"
         success, out, err = await async_run_command(f"docker run -d --name {name} ubuntu sleep infinity")
         if success:
-            live_feed_docker.put(f"Docker: Created container {name} at {datetime.now()}")
+            docker_feed_queue.put(f"Docker: Created container {name} at {datetime.now()}")
             app_state["terminal_output"].put(f"Created {name}")
         else:
-            live_feed_docker.put(f"Docker: Error creating {name}: {err} at {datetime.now()}")
+            docker_feed_queue.put(f"Docker: Error creating {name}: {err} at {datetime.now()}")
             app_state["terminal_output"].put(f"Error: {err}")
     elif action == "remove" and container:
         success, _, err = await async_run_command(f"docker rm -f {container}")
         if success:
-            live_feed_docker.put(f"Docker: Removed container {container} at {datetime.now()}")
+            docker_feed_queue.put(f"Docker: Removed container {container} at {datetime.now()}")
             app_state["terminal_output"].put(f"Removed {container}")
         else:
-            live_feed_docker.put(f"Docker: Error removing {container}: {err} at {datetime.now()}")
+            docker_feed_queue.put(f"Docker: Error removing {container}: {err} at {datetime.now()}")
             app_state["terminal_output"].put(f"Error: {err}")
     elif action == "exec" and container and cmd:
         success, out, err = await async_run_command(f"docker exec {container} {cmd}")
         app_state["terminal_output"].put(f"$ {cmd}\n{out if success else err}")
-        live_feed_docker.put(f"Docker: Executed '{cmd}' in {container}: {'Success' if success else 'Failed'} at {datetime.now()}")
+        docker_feed_queue.put(f"Docker: Executed '{cmd}' in {container}: {'Success' if success else 'Failed'} at {datetime.now()}")
 
 # Kubernetes Management
 async def update_k8s_status():
@@ -218,7 +253,7 @@ async def update_k8s_status():
     if success:
         with state_lock:
             app_state["k8s_namespaces"] = {ns: "Active" for ns in out.splitlines() if ns.strip()}
-        live_feed_k8s.put(f"K8s Status Update: {len(app_state['k8s_namespaces'])} namespaces active at {datetime.now()}")
+        k8s_feed_queue.put(f"K8s Status Update: {len(app_state['k8s_namespaces'])} namespaces active at {datetime.now()}")
 
 async def k8s_action(action, namespace=None, cmd=None):
     if action == "create":
@@ -226,23 +261,23 @@ async def k8s_action(action, namespace=None, cmd=None):
         name = f"dc-ns-{count}"
         success, out, err = await async_run_command(f"kubectl create namespace {name}")
         if success:
-            live_feed_k8s.put(f"K8s: Created namespace {name} at {datetime.now()}")
+            k8s_feed_queue.put(f"K8s: Created namespace {name} at {datetime.now()}")
             app_state["terminal_output"].put(f"Created {name}")
         else:
-            live_feed_k8s.put(f"K8s: Error creating {name}: {err} at {datetime.now()}")
+            k8s_feed_queue.put(f"K8s: Error creating {name}: {err} at {datetime.now()}")
             app_state["terminal_output"].put(f"Error: {err}")
     elif action == "remove" and namespace:
         success, _, err = await async_run_command(f"kubectl delete namespace {namespace}")
         if success:
-            live_feed_k8s.put(f"K8s: Removed namespace {namespace} at {datetime.now()}")
+            k8s_feed_queue.put(f"K8s: Removed namespace {namespace} at {datetime.now()}")
             app_state["terminal_output"].put(f"Removed {namespace}")
         else:
-            live_feed_k8s.put(f"K8s: Error removing {namespace}: {err} at {datetime.now()}")
+            k8s_feed_queue.put(f"K8s: Error removing {namespace}: {err} at {datetime.now()}")
             app_state["terminal_output"].put(f"Error: {err}")
     elif action == "exec" and cmd:
         success, out, err = await async_run_command(f"kubectl {cmd}")
         app_state["terminal_output"].put(f"$ {cmd}\n{out if success else err}")
-        live_feed_k8s.put(f"K8s: Executed '{cmd}': {'Success' if success else 'Failed'} at {datetime.now()}")
+        k8s_feed_queue.put(f"K8s: Executed '{cmd}': {'Success' if success else 'Failed'} at {datetime.now()}")
 
 # Real-Time Status Updater
 def status_updater():
@@ -251,7 +286,7 @@ def status_updater():
     while True:
         loop.run_until_complete(update_docker_status())
         loop.run_until_complete(update_k8s_status())
-        time.sleep(1)  # Update every second
+        time.sleep(1)
 
 # Start Background Tasks
 threading.Thread(target=status_updater, daemon=True).start()
@@ -259,22 +294,22 @@ threading.Thread(target=lambda: asyncio.run(ai_auto_scaling()), daemon=True).sta
 threading.Thread(target=weekly_report, daemon=True).start()
 
 # SSE Feeds
-@app.route("/live_feed_docker")
-def live_feed_docker():
+@app.route("/docker_feed_stream")
+def docker_feed_stream():
     def event_stream():
         while True:
-            item = live_feed_docker.get() if not live_feed_docker.empty() else f"Docker: No new events at {datetime.now()}"
+            item = docker_feed_queue.get() if not docker_feed_queue.empty() else f"Docker: No new events at {datetime.now()}"
             yield f"data: {item}\n\n"
-            time.sleep(1)  # Stream every second
+            time.sleep(1)
     return Response(event_stream(), mimetype="text/event-stream")
 
-@app.route("/live_feed_k8s")
-def live_feed_k8s():
+@app.route("/k8s_feed_stream")
+def k8s_feed_stream():
     def event_stream():
         while True:
-            item = live_feed_k8s.get() if not live_feed_k8s.empty() else f"K8s: No new events at {datetime.now()}"
+            item = k8s_feed_queue.get() if not k8s_feed_queue.empty() else f"K8s: No new events at {datetime.now()}"
             yield f"data: {item}\n\n"
-            time.sleep(1)  # Stream every second
+            time.sleep(1)
     return Response(event_stream(), mimetype="text/event-stream")
 
 # Template
@@ -410,12 +445,12 @@ MAIN_TEMPLATE = """
     </footer>
     <script>
         // SSE Feeds
-        new EventSource('/live_feed_docker').onmessage = e => {
+        new EventSource('/docker_feed_stream').onmessage = e => {
             const feed = document.getElementById('dockerFeed');
             feed.innerHTML += `<p class="text-sm">${e.data}</p>`;
             feed.scrollTop = feed.scrollHeight;
         };
-        new EventSource('/live_feed_k8s').onmessage = e => {
+        new EventSource('/k8s_feed_stream').onmessage = e => {
             const feed = document.getElementById('k8sFeed');
             feed.innerHTML += `<p class="text-sm">${e.data}</p>`;
             feed.scrollTop = k8sFeed.scrollHeight;
@@ -526,9 +561,9 @@ def ai_quick_query():
     system_txt = f"{app_state['environment']} assistant for a virtual datacenter"
     app_state["ai_response"] = ai_chat(user_txt, system_txt)
     if app_state["environment"] == "docker":
-        live_feed_docker.put(f"AI query by {session['user']}: {user_txt} at {datetime.now()}")
+        docker_feed_queue.put(f"AI query by {session['user']}: {user_txt} at {datetime.now()}")
     else:
-        live_feed_k8s.put(f"AI query by {session['user']}: {user_txt} at {datetime.now()}")
+        k8s_feed_queue.put(f"AI query by {session['user']}: {user_txt} at {datetime.now()}")
     return redirect("/")
 
 @app.route("/activate_docker_scenario/<int:index>")
@@ -536,12 +571,20 @@ def activate_docker_scenario(index):
     if "user" not in session or session["role"] == "viewer":
         return redirect("/")
     if 0 <= index < len(DOCKER_SCENARIOS):
-        scenario = DOCKER_SCENARIOS[index]
-        success, out, err = asyncio.run(async_run_command(scenario["cmd"]))
-        result = f"Activated {scenario['title']}:\n{out if success else err}"
-        app_state["scenario_result"] = result
-        live_feed_docker.put(f"Docker scenario '{scenario['title']}' activated by {session['user']} at {datetime.now()}")
-        app_state["terminal_output"].put(result)
+        try:
+            scenario = DOCKER_SCENARIOS[index]
+            success, out, err = asyncio.run(async_run_command(scenario["cmd"]))
+            result = f"Activated {scenario['title']}:\n{out if success else err}"
+            if success and "run -d" in scenario["cmd"]:  # Check if it's a container deployment
+                container_name = scenario["cmd"].split("--name ")[1].split()[0]
+                access_info = get_docker_access_info(container_name)
+                result += f"\n{access_info}"
+            app_state["scenario_result"] = result
+            docker_feed_queue.put(f"Docker scenario '{scenario['title']}' activated by {session['user']} at {datetime.now()}")
+            app_state["terminal_output"].put(result)
+        except Exception as e:
+            logging.error(f"Docker scenario {index} failed: {e}")
+            app_state["scenario_result"] = f"Error activating {DOCKER_SCENARIOS[index]['title']}: {str(e)}"
     return redirect("/")
 
 @app.route("/activate_k8s_scenario/<int:index>")
@@ -549,12 +592,20 @@ def activate_k8s_scenario(index):
     if "user" not in session or session["role"] == "viewer":
         return redirect("/")
     if 0 <= index < len(K8S_SCENARIOS):
-        scenario = K8S_SCENARIOS[index]
-        success, out, err = asyncio.run(async_run_command(scenario["cmd"]))
-        result = f"Activated {scenario['title']}:\n{out if success else err}"
-        app_state["scenario_result"] = result
-        live_feed_k8s.put(f"K8s scenario '{scenario['title']}' activated by {session['user']} at {datetime.now()}")
-        app_state["terminal_output"].put(result)
+        try:
+            scenario = K8S_SCENARIOS[index]
+            success, out, err = asyncio.run(async_run_command(scenario["cmd"]))
+            result = f"Activated {scenario['title']}:\n{out if success else err}"
+            if success and "expose" in scenario["cmd"]:  # Check if it's a service exposure
+                service_name = scenario["cmd"].split(" ")[3]
+                access_info = get_k8s_access_info(service_name)
+                result += f"\n{access_info}"
+            app_state["scenario_result"] = result
+            k8s_feed_queue.put(f"K8s scenario '{scenario['title']}' activated by {session['user']} at {datetime.now()}")
+            app_state["terminal_output"].put(result)
+        except Exception as e:
+            logging.error(f"K8s scenario {index} failed: {e}")
+            app_state["scenario_result"] = f"Error activating {K8S_SCENARIOS[index]['title']}: {str(e)}"
     return redirect("/")
 
 @app.route("/status_data")
