@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""
+AI-Powered Docker Kubernetes Data Center Dashboard
+
+Features:
+- 100 Docker & 100 Kubernetes Scenarios
+- Real-Time Docker & K8s Feeds (Updated Every Second)
+- Full Implementation of 10 Phases
+"""
+
+import subprocess
+import asyncio
+import threading
+import logging
+import json
+import smtplib
+from datetime import datetime, timedelta
+from queue import Queue
+from flask import Flask, request, render_template_string, Response, redirect, session
+from flask_basicauth import BasicAuth
+import aiohttp
+from email.mime.text import MIMEText
+
+try:
+    import ollama
+except ImportError:
+    ollama = None
+    print("Ollama not installed; AI features limited.")
+
+# App Setup
+app = Flask(__name__)
+app.secret_key = 'supersecretkeyfordatacenter'
+app.config['BASIC_AUTH_USERNAME'] = 'admin'
+app.config['BASIC_AUTH_PASSWORD'] = 'datacenter2025'
+app.config['BASIC_AUTH_FORCE'] = True
+basic_auth = BasicAuth(app)
+
+# Logging
+logging.basicConfig(filename='datacenter.log', level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Global State
+state_lock = threading.Lock()
+app_state = {
+    "environment": "docker",
+    "docker_containers": {},
+    "k8s_namespaces": {},
+    "terminal_output": Queue(maxsize=100),
+    "ai_response": "",
+    "scenario_result": "",
+    "scaling_events": []
+}
+live_feed_docker = Queue(maxsize=500)
+live_feed_k8s = Queue(maxsize=500)
+
+# User Roles for RBAC
+users = {
+    "admin": {"password": "datacenter2025", "role": "admin"},
+    "operator": {"password": "operator123", "role": "operator"},
+    "viewer": {"password": "viewer456", "role": "viewer"}
+}
+
+# Notification Config
+NOTIFICATION_CONFIG = {
+    "email": {
+        "server": "smtp.example.com",
+        "port": 587,
+        "user": "noreply@example.com",
+        "pass": "your-email-password",
+        "to": "ops-team@example.com"
+    },
+    "slack": "https://hooks.slack.com/services/XXX/YYY/ZZZ",
+    "discord": "https://discord.com/api/webhooks/AAA/BBB"
+}
+
+# 100 Docker Scenarios
+DOCKER_SCENARIOS = [
+    {"title": "Deploy Nginx Web", "desc": "Launch Nginx container", "cmd": "docker run -d --name nginx_web -p 80:80 nginx:latest"},
+    {"title": "Scale App Instances", "desc": "Run 3 app instances", "cmd": "docker run -d --name app_1 ubuntu sleep infinity && docker run -d --name app_2 ubuntu sleep infinity && docker run -d --name app_3 ubuntu sleep infinity"},
+    {"title": "Cleanup Unused", "desc": "Remove stopped containers", "cmd": "docker container prune -f"},
+    {"title": "Monitor Nginx Logs", "desc": "Tail logs of Nginx", "cmd": "docker logs -f nginx_web"},
+    {"title": "Deploy Redis", "desc": "Run Redis container", "cmd": "docker run -d --name redis_db -p 6379:6379 redis:latest"},
+    {"title": "Run MySQL", "desc": "Launch MySQL container", "cmd": "docker run -d --name mysql_db -e MYSQL_ROOT_PASSWORD=root -p 3306:3306 mysql:latest"},
+    {"title": "Start Jenkins", "desc": "Run Jenkins CI/CD", "cmd": "docker run -d --name jenkins -p 8080:8080 jenkins/jenkins:lts"},
+    {"title": "Deploy Postgres", "desc": "Run Postgres DB", "cmd": "docker run -d --name postgres_db -e POSTGRES_PASSWORD=pass -p 5432:5432 postgres:latest"},
+    {"title": "Run Apache", "desc": "Launch Apache server", "cmd": "docker run -d --name apache_web -p 8081:80 httpd:latest"},
+    {"title": "Start MongoDB", "desc": "Run MongoDB container", "cmd": "docker run -d --name mongo_db -p 27017:27017 mongo:latest"}
+] + [{"title": f"Run Test Container {i}", "desc": f"Launch test container {i}", "cmd": f"docker run -d --name test_container_{i} ubuntu sleep infinity"} for i in range(1, 91)]
+
+# 100 Kubernetes Scenarios
+K8S_SCENARIOS = [
+    {"title": "Deploy Nginx Pod", "desc": "Create Nginx deployment", "cmd": "kubectl create deployment nginx --image=nginx --replicas=1"},
+    {"title": "Expose Nginx Service", "desc": "Expose Nginx as NodePort", "cmd": "kubectl expose deployment nginx --port=80 --type=NodePort"},
+    {"title": "Scale Nginx Pods", "desc": "Scale Nginx to 3 replicas", "cmd": "kubectl scale deployment nginx --replicas=3"},
+    {"title": "Cleanup Default NS", "desc": "Delete all in default ns", "cmd": "kubectl delete all --all -n default"},
+    {"title": "Deploy Redis", "desc": "Create Redis deployment", "cmd": "kubectl create deployment redis --image=redis --replicas=1"},
+    {"title": "Expose Redis", "desc": "Expose Redis service", "cmd": "kubectl expose deployment redis --port=6379 --type=ClusterIP"},
+    {"title": "Run MySQL", "desc": "Deploy MySQL pod", "cmd": "kubectl run mysql --image=mysql:latest --env='MYSQL_ROOT_PASSWORD=root' --restart=Never"},
+    {"title": "Deploy Jenkins", "desc": "Run Jenkins deployment", "cmd": "kubectl create deployment jenkins --image=jenkins/jenkins:lts --replicas=1"},
+    {"title": "Expose Jenkins", "desc": "Expose Jenkins service", "cmd": "kubectl expose deployment jenkins --port=8080 --type=NodePort"},
+    {"title": "Create ConfigMap", "desc": "Add a config map", "cmd": "kubectl create configmap test-config --from-literal=key=value"}
+] + [{"title": f"Create Namespace {i}", "desc": f"Add namespace ns-{i}", "cmd": f"kubectl create namespace ns-{i}"} for i in range(1, 91)]
+
+# Async Command Execution
+async def async_run_command(cmd):
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await proc.communicate()
+        return True, stdout.decode().strip(), stderr.decode().strip()
+    except Exception as e:
+        logging.error(f"Command failed: {cmd}, Error: {e}")
+        return False, "", str(e)
+
+# Notification Functions
+async def send_email_notification(subject, message):
+    try:
+        msg = MIMEText(message)
+        msg["Subject"] = subject
+        msg["From"] = NOTIFICATION_CONFIG["email"]["user"]
+        msg["To"] = NOTIFICATION_CONFIG["email"]["to"]
+        with smtplib.SMTP(NOTIFICATION_CONFIG["email"]["server"], NOTIFICATION_CONFIG["email"]["port"]) as s:
+            s.starttls()
+            s.login(NOTIFICATION_CONFIG["email"]["user"], NOTIFICATION_CONFIG["email"]["pass"])
+            s.sendmail(NOTIFICATION_CONFIG["email"]["user"], NOTIFICATION_CONFIG["email"]["to"], msg.as_string())
+        logging.info(f"Email sent: {subject}")
+    except Exception as e:
+        logging.error(f"Email failed: {e}")
+
+async def send_slack_discord_notification(message):
+    async with aiohttp.ClientSession() as session:
+        await session.post(NOTIFICATION_CONFIG["slack"], json={"text": message})
+        await session.post(NOTIFICATION_CONFIG["discord"], json={"content": message})
+        logging.info(f"Slack/Discord sent: {message}")
+
+# AI Integration
+def ai_chat(user_txt, system_txt=None):
+    if not ollama:
+        return "AI unavailable."
+    messages = [{"role": "system", "content": system_txt}] if system_txt else []
+    messages.append({"role": "user", "content": user_txt})
+    try:
+        response = ollama.chat(model="deepseek-r1:1.5b", messages=messages)
+        return response["message"]["content"].strip()
+    except Exception as e:
+        logging.error(f"AI error: {e}")
+        return "AI error occurred."
+
+# AI Auto-Scaling
+async def ai_auto_scaling():
+    while True:
+        with state_lock:
+            docker_count = len(app_state["docker_containers"])
+            k8s_count = len(app_state["k8s_namespaces"])
+            if app_state["environment"] == "docker" and docker_count < 5:
+                await async_run_command("docker run -d --name auto_scaled_container ubuntu sleep infinity")
+                event = f"AI Auto-Scaled Docker: Added container at {datetime.now()}"
+                app_state["scaling_events"].append(event)
+                live_feed_docker.put(event)
+                await send_email_notification("AI Scaling Event", event)
+                await send_slack_discord_notification(event)
+            elif app_state["environment"] == "k8s" and k8s_count < 3:
+                await async_run_command("kubectl create namespace auto_scaled_ns")
+                event = f"AI Auto-Scaled K8s: Added namespace at {datetime.now()}"
+                app_state["scaling_events"].append(event)
+                live_feed_k8s.put(event)
+                await send_email_notification("AI Scaling Event", event)
+                await send_slack_discord_notification(event)
+        await asyncio.sleep(60)
+
+# Weekly Report
+def weekly_report():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    while True:
+        now = datetime.now()
+        if now.weekday() == 0 and now.hour == 9:
+            with state_lock:
+                report = "Weekly AI Scaling Report\n\n" + "\n".join(app_state["scaling_events"])
+                loop.run_until_complete(send_email_notification("Weekly AI Scaling Report", report))
+            time.sleep(24 * 3600)
+        time.sleep(3600)
+
+# Docker Management
+async def update_docker_status():
+    success, out, _ = await async_run_command("docker ps -a --format '{{.Names}} {{.Status}}'")
+    if success:
+        with state_lock:
+            app_state["docker_containers"] = {line.split()[0]: " ".join(line.split()[1:]) for line in out.splitlines() if line.strip()}
+        live_feed_docker.put(f"Docker Status Update: {len(app_state['docker_containers'])} containers running at {datetime.now()}")
+
+async def docker_action(action, container=None, cmd=None):
+    if action == "create":
+        name = f"dc_container_{len(app_state['docker_containers']) + 1}"
+        success, out, err = await async_run_command(f"docker run -d --name {name} ubuntu sleep infinity")
+        if success:
+            live_feed_docker.put(f"Docker: Created container {name} at {datetime.now()}")
+            app_state["terminal_output"].put(f"Created {name}")
+        else:
+            live_feed_docker.put(f"Docker: Error creating {name}: {err} at {datetime.now()}")
+            app_state["terminal_output"].put(f"Error: {err}")
+    elif action == "remove" and container:
+        success, _, err = await async_run_command(f"docker rm -f {container}")
+        if success:
+            live_feed_docker.put(f"Docker: Removed container {container} at {datetime.now()}")
+            app_state["terminal_output"].put(f"Removed {container}")
+        else:
+            live_feed_docker.put(f"Docker: Error removing {container}: {err} at {datetime.now()}")
+            app_state["terminal_output"].put(f"Error: {err}")
+    elif action == "exec" and container and cmd:
+        success, out, err = await async_run_command(f"docker exec {container} {cmd}")
+        app_state["terminal_output"].put(f"$ {cmd}\n{out if success else err}")
+        live_feed_docker.put(f"Docker: Executed '{cmd}' in {container}: {'Success' if success else 'Failed'} at {datetime.now()}")
+
+# Kubernetes Management
+async def update_k8s_status():
+    success, out, _ = await async_run_command("kubectl get ns --no-headers -o custom-columns=NAME:.metadata.name")
+    if success:
+        with state_lock:
+            app_state["k8s_namespaces"] = {ns: "Active" for ns in out.splitlines() if ns.strip()}
+        live_feed_k8s.put(f"K8s Status Update: {len(app_state['k8s_namespaces'])} namespaces active at {datetime.now()}")
+
+async def k8s_action(action, namespace=None, cmd=None):
+    if action == "create":
+        count = len(app_state["k8s_namespaces"]) + 1
+        name = f"dc-ns-{count}"
+        success, out, err = await async_run_command(f"kubectl create namespace {name}")
+        if success:
+            live_feed_k8s.put(f"K8s: Created namespace {name} at {datetime.now()}")
+            app_state["terminal_output"].put(f"Created {name}")
+        else:
+            live_feed_k8s.put(f"K8s: Error creating {name}: {err} at {datetime.now()}")
+            app_state["terminal_output"].put(f"Error: {err}")
+    elif action == "remove" and namespace:
+        success, _, err = await async_run_command(f"kubectl delete namespace {namespace}")
+        if success:
+            live_feed_k8s.put(f"K8s: Removed namespace {namespace} at {datetime.now()}")
+            app_state["terminal_output"].put(f"Removed {namespace}")
+        else:
+            live_feed_k8s.put(f"K8s: Error removing {namespace}: {err} at {datetime.now()}")
+            app_state["terminal_output"].put(f"Error: {err}")
+    elif action == "exec" and cmd:
+        success, out, err = await async_run_command(f"kubectl {cmd}")
+        app_state["terminal_output"].put(f"$ {cmd}\n{out if success else err}")
+        live_feed_k8s.put(f"K8s: Executed '{cmd}': {'Success' if success else 'Failed'} at {datetime.now()}")
+
+# Real-Time Status Updater
+def status_updater():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    while True:
+        loop.run_until_complete(update_docker_status())
+        loop.run_until_complete(update_k8s_status())
+        time.sleep(1)  # Update every second
+
+# Start Background Tasks
+threading.Thread(target=status_updater, daemon=True).start()
+threading.Thread(target=lambda: asyncio.run(ai_auto_scaling()), daemon=True).start()
+threading.Thread(target=weekly_report, daemon=True).start()
+
+# SSE Feeds
+@app.route("/live_feed_docker")
+def live_feed_docker():
+    def event_stream():
+        while True:
+            item = live_feed_docker.get() if not live_feed_docker.empty() else f"Docker: No new events at {datetime.now()}"
+            yield f"data: {item}\n\n"
+            time.sleep(1)  # Stream every second
+    return Response(event_stream(), mimetype="text/event-stream")
+
+@app.route("/live_feed_k8s")
+def live_feed_k8s():
+    def event_stream():
+        while True:
+            item = live_feed_k8s.get() if not live_feed_k8s.empty() else f"K8s: No new events at {datetime.now()}"
+            yield f"data: {item}\n\n"
+            time.sleep(1)  # Stream every second
+    return Response(event_stream(), mimetype="text/event-stream")
+
+# Template
+MAIN_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI-Powered Data Center Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        .terminal { max-height: 200px; overflow-y: auto; background: #1a1a1a; }
+        .feed { max-height: 150px; overflow-y: auto; background: #1a1a1a; }
+        .scenario-btn { cursor: pointer; }
+    </style>
+</head>
+<body class="bg-gray-900 text-white">
+    <header class="bg-gray-800 p-4">
+        <div class="container mx-auto flex justify-between items-center">
+            <h1 class="text-2xl font-bold">AI Data Center</h1>
+            <div class="flex space-x-4">
+                <span>User: {{ user }} ({{ role }})</span>
+                <form method="post" action="/set_environment" class="flex space-x-2">
+                    <select name="environment" class="bg-gray-700 rounded p-2 text-white">
+                        <option value="docker" {% if environment=='docker' %}selected{% endif %}>Docker</option>
+                        <option value="k8s" {% if environment=='k8s' %}selected{% endif %}>Kubernetes</option>
+                    </select>
+                    <button class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded">Switch</button>
+                </form>
+                <form method="post" action="/logout"><button class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded">Logout</button></form>
+            </div>
+        </div>
+    </header>
+    <main class="container mx-auto p-4 grid grid-cols-1 md:grid-cols-4 gap-4">
+        <aside class="md:col-span-1 bg-gray-800 p-4 rounded overflow-y-auto max-h-screen">
+            <h2 class="text-lg font-semibold mb-2">Scenarios</h2>
+            <div class="space-y-2">
+                {% if environment=='docker' %}
+                    {% for sc in docker_scenarios %}
+                        {% if role == 'admin' or role == 'operator' %}
+                            <a href="/activate_docker_scenario/{{ loop.index0 }}" class="block bg-gray-700 p-2 rounded hover:bg-gray-600 scenario-btn">{{ sc.title }}: {{ sc.desc }}</a>
+                        {% else %}
+                            <p class="block bg-gray-700 p-2 rounded text-gray-500">{{ sc.title }}: {{ sc.desc }} (No Access)</p>
+                        {% endif %}
+                    {% endfor %}
+                {% else %}
+                    {% for sc in k8s_scenarios %}
+                        {% if role == 'admin' or role == 'operator' %}
+                            <a href="/activate_k8s_scenario/{{ loop.index0 }}" class="block bg-gray-700 p-2 rounded hover:bg-gray-600 scenario-btn">{{ sc.title }}: {{ sc.desc }}</a>
+                        {% else %}
+                            <p class="block bg-gray-700 p-2 rounded text-gray-500">{{ sc.title }}: {{ sc.desc }} (No Access)</p>
+                        {% endif %}
+                    {% endfor %}
+                {% endif %}
+            </div>
+        </aside>
+        <section class="md:col-span-3 space-y-4">
+            <div class="bg-gray-800 p-4 rounded">
+                {% if environment=='docker' %}
+                    <h2 class="text-xl font-semibold">Docker Management</h2>
+                    <p>Containers: {{ docker_containers|length }}</p>
+                    {% if role == 'admin' or role == 'operator' %}
+                        <form method="post" action="/docker_action" class="space-y-2">
+                            <select name="container" class="bg-gray-700 rounded p-2 w-full text-white">
+                                {% for name, status in docker_containers.items() %}
+                                    <option value="{{ name }}">{{ name }} ({{ status }})</option>
+                                {% endfor %}
+                            </select>
+                            <div class="flex space-x-2">
+                                <button name="action" value="create" class="bg-green-600 hover:bg-green-700 px-4 py-2 rounded">New Container</button>
+                                <button name="action" value="remove" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded">Remove</button>
+                                <input name="cmd" class="bg-gray-700 rounded p-2 flex-1 text-white" placeholder="Exec command">
+                                <button name="action" value="exec" class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded">Run</button>
+                            </div>
+                        </form>
+                    {% else %}
+                        <p class="text-gray-500">View-only mode</p>
+                    {% endif %}
+                {% else %}
+                    <h2 class="text-xl font-semibold">Kubernetes Management</h2>
+                    <p>Namespaces: {{ k8s_namespaces|length }}</p>
+                    {% if role == 'admin' or role == 'operator' %}
+                        <form method="post" action="/k8s_action" class="space-y-2">
+                            <select name="namespace" class="bg-gray-700 rounded p-2 w-full text-white">
+                                {% for name, status in k8s_namespaces.items() %}
+                                    <option value="{{ name }}">{{ name }} ({{ status }})</option>
+                                {% endfor %}
+                            </select>
+                            <div class="flex space-x-2">
+                                <button name="action" value="create" class="bg-green-600 hover:bg-green-700 px-4 py-2 rounded">New Namespace</button>
+                                <button name="action" value="remove" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded">Remove</button>
+                                <input name="cmd" class="bg-gray-700 rounded p-2 flex-1 text-white" placeholder="Kubectl command">
+                                <button name="action" value="exec" class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded">Run</button>
+                            </div>
+                        </form>
+                    {% else %}
+                        <p class="text-gray-500">View-only mode</p>
+                    {% endif %}
+                {% endif %}
+                <div class="terminal p-2 rounded mt-2 text-gray-300">{{ terminal_output }}</div>
+            </div>
+            <div class="bg-gray-800 p-4 rounded">
+                <h2 class="text-xl font-semibold">AI Query</h2>
+                <form method="post" action="/ai_quick_query" class="flex space-x-2">
+                    <input name="user_text" class="bg-gray-700 rounded p-2 flex-1 text-white" placeholder="Ask AI">
+                    <button class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded">Ask</button>
+                </form>
+                {% if ai_response %}<p class="mt-2 bg-gray-700 p-2 rounded text-gray-300">{{ ai_response }}</p>{% endif %}
+            </div>
+            <div class="bg-gray-800 p-4 rounded">
+                <h2 class="text-xl font-semibold">Scenario Result</h2>
+                <pre class="bg-gray-700 p-2 rounded text-gray-300">{{ scenario_result }}</pre>
+            </div>
+        </section>
+    </main>
+    <footer class="container mx-auto p-4 space-y-4">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div class="bg-gray-800 p-4 rounded">
+                <h2 class="text-lg font-semibold">Docker Feed</h2>
+                <div id="dockerFeed" class="feed p-2 rounded text-gray-300"></div>
+            </div>
+            <div class="bg-gray-800 p-4 rounded">
+                <h2 class="text-lg font-semibold">K8s Feed</h2>
+                <div id="k8sFeed" class="feed p-2 rounded text-gray-300"></div>
+            </div>
+            <div class="bg-gray-800 p-4 rounded">
+                <h2 class="text-lg font-semibold">Resource Status</h2>
+                <canvas id="statusChart" height="100"></canvas>
+            </div>
+        </div>
+    </footer>
+    <script>
+        // SSE Feeds
+        new EventSource('/live_feed_docker').onmessage = e => {
+            const feed = document.getElementById('dockerFeed');
+            feed.innerHTML += `<p class="text-sm">${e.data}</p>`;
+            feed.scrollTop = feed.scrollHeight;
+        };
+        new EventSource('/live_feed_k8s').onmessage = e => {
+            const feed = document.getElementById('k8sFeed');
+            feed.innerHTML += `<p class="text-sm">${e.data}</p>`;
+            feed.scrollTop = k8sFeed.scrollHeight;
+        };
+
+        // Chart.js
+        const ctx = document.getElementById('statusChart').getContext('2d');
+        const chart = new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels: ['Docker Containers', 'K8s Namespaces'],
+                datasets: [{
+                    label: 'Count',
+                    data: [{{ docker_containers|length }}, {{ k8s_namespaces|length }}],
+                    backgroundColor: ['#4CAF50', '#2196F3'],
+                    borderColor: ['#388E3C', '#1976D2'],
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                scales: { y: { beginAtZero: true, ticks: { precision: 0 } } },
+                plugins: { legend: { display: false } }
+            }
+        });
+
+        // Auto-refresh chart
+        setInterval(() => {
+            fetch('/status_data').then(res => res.json()).then(data => {
+                chart.data.datasets[0].data = [data.docker, data.k8s];
+                chart.update();
+            });
+        }, 5000);
+    </script>
+</body>
+</html>
+"""
+
+# Routes
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form.get("username")
+        password = request.form.get("password")
+        if username in users and users[username]["password"] == password:
+            session["user"] = username
+            session["role"] = users[username]["role"]
+            return redirect("/")
+        return "Invalid credentials", 401
+    return """
+        <form method="post">
+            <input type="text" name="username" placeholder="Username"><br>
+            <input type="password" name="password" placeholder="Password"><br>
+            <button type="submit">Login</button>
+        </form>
+    """
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.pop("user", None)
+    session.pop("role", None)
+    return redirect("/login")
+
+@app.route("/")
+def dashboard():
+    if "user" not in session:
+        return redirect("/login")
+    terminal = "\n".join(list(app_state["terminal_output"].queue)) or "No output yet."
+    return render_template_string(
+        MAIN_TEMPLATE, environment=app_state["environment"], docker_containers=app_state["docker_containers"],
+        k8s_namespaces=app_state["k8s_namespaces"], terminal_output=terminal, ai_response=app_state["ai_response"],
+        scenario_result=app_state["scenario_result"], docker_scenarios=DOCKER_SCENARIOS, k8s_scenarios=K8S_SCENARIOS,
+        user=session["user"], role=session["role"]
+    )
+
+@app.route("/set_environment", methods=["POST"])
+def set_environment():
+    if "user" not in session:
+        return redirect("/login")
+    with state_lock:
+        app_state["environment"] = request.form.get("environment", "docker")
+    return redirect("/")
+
+@app.route("/docker_action", methods=["POST"])
+def docker_action_route():
+    if "user" not in session or session["role"] == "viewer":
+        return redirect("/")
+    action = request.form.get("action")
+    container = request.form.get("container")
+    cmd = request.form.get("cmd")
+    asyncio.run(docker_action(action, container, cmd))
+    return redirect("/")
+
+@app.route("/k8s_action", methods=["POST"])
+def k8s_action_route():
+    if "user" not in session or session["role"] == "viewer":
+        return redirect("/")
+    action = request.form.get("action")
+    namespace = request.form.get("namespace")
+    cmd = request.form.get("cmd")
+    asyncio.run(k8s_action(action, namespace, cmd))
+    return redirect("/")
+
+@app.route("/ai_quick_query", methods=["POST"])
+def ai_quick_query():
+    if "user" not in session:
+        return redirect("/login")
+    user_txt = request.form.get("user_text", "")
+    system_txt = f"{app_state['environment']} assistant for a virtual datacenter"
+    app_state["ai_response"] = ai_chat(user_txt, system_txt)
+    if app_state["environment"] == "docker":
+        live_feed_docker.put(f"AI query by {session['user']}: {user_txt} at {datetime.now()}")
+    else:
+        live_feed_k8s.put(f"AI query by {session['user']}: {user_txt} at {datetime.now()}")
+    return redirect("/")
+
+@app.route("/activate_docker_scenario/<int:index>")
+def activate_docker_scenario(index):
+    if "user" not in session or session["role"] == "viewer":
+        return redirect("/")
+    if 0 <= index < len(DOCKER_SCENARIOS):
+        scenario = DOCKER_SCENARIOS[index]
+        success, out, err = asyncio.run(async_run_command(scenario["cmd"]))
+        result = f"Activated {scenario['title']}:\n{out if success else err}"
+        app_state["scenario_result"] = result
+        live_feed_docker.put(f"Docker scenario '{scenario['title']}' activated by {session['user']} at {datetime.now()}")
+        app_state["terminal_output"].put(result)
+    return redirect("/")
+
+@app.route("/activate_k8s_scenario/<int:index>")
+def activate_k8s_scenario(index):
+    if "user" not in session or session["role"] == "viewer":
+        return redirect("/")
+    if 0 <= index < len(K8S_SCENARIOS):
+        scenario = K8S_SCENARIOS[index]
+        success, out, err = asyncio.run(async_run_command(scenario["cmd"]))
+        result = f"Activated {scenario['title']}:\n{out if success else err}"
+        app_state["scenario_result"] = result
+        live_feed_k8s.put(f"K8s scenario '{scenario['title']}' activated by {session['user']} at {datetime.now()}")
+        app_state["terminal_output"].put(result)
+    return redirect("/")
+
+@app.route("/status_data")
+def status_data():
+    with state_lock:
+        return json.dumps({"docker": len(app_state["docker_containers"]), "k8s": len(app_state["k8s_namespaces"])})
+
+if __name__ == "__main__":
+    success, _, err = asyncio.run(async_run_command("docker info"))
+    if not success:
+        logging.error(f"Docker not running: {err}")
+        print("Warning: Docker not running or accessible.")
+    success, _, err = asyncio.run(async_run_command("kubectl cluster-info"))
+    if not success:
+        logging.error(f"Kubernetes not running: {err}")
+        print("Warning: Kubernetes not running or accessible.")
+    app.run(debug=False, host="0.0.0.0", port=5000, threaded=True)
